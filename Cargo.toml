@@ -1,0 +1,6 @@
+[workspace]
+
+members = [
+	"lib_pgsql",
+	"lib_redis",
+]

@@ -1,0 +1,15 @@
+[package]
+name = "lib_redis"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "0.1.73"
+serde = {version = "1.0.188", features = ["derive"]}
+futures-util = "0.3.28"
+env_logger = "0.10.0"
+tokio = {version = "1.32.0", features = ["full"]}
+deadpool-redis = { version = "0.13", features = ["serde"] }
+log = "0.4.20"
