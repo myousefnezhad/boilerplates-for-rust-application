@@ -22,7 +22,7 @@ use tokio_postgres::{
 pub trait Queryable<'a> {
     /// This should be `Self` for each struct in `impl` section
     ///
-    /// ```
+    /// ```no_run
     /// impl Queryable<'_> for ExampleTable {
     ///    type RowType = Self;
     ///    fn table_name() -> &'static str {
@@ -97,9 +97,8 @@ pub trait Queryable<'a> {
     ) -> Result<u64, SQLError> {
         let client = pool.connection(is_read_only).get().await?;
         let query_str = Self::query_as_string(&query, Some(&pool)).await?;
-        let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Execute {}", query_str);
-        Ok(client.execute(&statement, params).await?)
+        Ok(client.execute(&query_str, params).await?)
     }
 
     /// The maximally flexible version of [`execute`].
@@ -121,9 +120,9 @@ pub trait Queryable<'a> {
     {
         let client = pool.connection(is_read_only).get().await?;
         let query_str = Self::query_as_string(&query, Some(&pool)).await?;
-        let statement = Self::prepare_cached(&client, &query_str).await?;
+        // let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Execute raw {}", query_str);
-        Ok(client.execute_raw(&statement, params).await?)
+        Ok(client.execute_raw(&query_str, params).await?)
     }
 
     /// Executes a statement, returning a vector of the resulting rows.
@@ -138,9 +137,9 @@ pub trait Queryable<'a> {
     ) -> Result<Vec<Row>, SQLError> {
         let client = pool.connection(is_read_only).get().await?;
         let query_str = Self::query_as_string(&query, Some(&pool)).await?;
-        let statement = Self::prepare_cached(&client, &query_str).await?;
+        // let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Query {}", query_str);
-        Ok(client.query(&statement, params).await?)
+        Ok(client.query(&query_str, params).await?)
     }
 
     /// Executes a statement which returns a single row, returning it.
@@ -157,9 +156,9 @@ pub trait Queryable<'a> {
     ) -> Result<Row, SQLError> {
         let client = pool.connection(is_read_only).get().await?;
         let query_str = Self::query_as_string(&query, Some(&pool)).await?;
-        let statement = Self::prepare_cached(&client, &query_str).await?;
+        // let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Query one {}", query_str);
-        Ok(client.query_one(&statement, params).await?)
+        Ok(client.query_one(&query_str, params).await?)
     }
 
     /// Executes a statements which returns zero or one rows, returning it.
@@ -176,9 +175,9 @@ pub trait Queryable<'a> {
     ) -> Result<Option<Row>, SQLError> {
         let client = pool.connection(is_read_only).get().await?;
         let query_str = Self::query_as_string(&query, Some(&pool)).await?;
-        let statement = Self::prepare_cached(&client, &query_str).await?;
+        // let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Query opt {}", query_str);
-        Ok(client.query_opt(&statement, params).await?)
+        Ok(client.query_opt(&query_str, params).await?)
     }
 
     /// The maximally flexible version of [`query`].
@@ -200,9 +199,9 @@ pub trait Queryable<'a> {
     {
         let client = pool.connection(is_read_only).get().await?;
         let query_str = Self::query_as_string(&query, Some(&pool)).await?;
-        let statement = Self::prepare_cached(&client, &query_str).await?;
+        // let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Query raw {}", query_str);
-        Ok(client.query_raw(&statement, params).await?)
+        Ok(client.query_raw(&query_str, params).await?)
     }
 
     /// This function converts PostgreSQL Row type to provided type in RowType section (Rust struct type)
@@ -387,11 +386,8 @@ pub trait Queryable<'a> {
         field_list: Option<Vec<&str>>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
-        sort_list: Option<Vec<&str>>,
-        sort_type: Option<SQLSort>,
     ) -> Result<Row, SQLError> {
-        let query =
-            Self::select_query_builder(table_name, field_list, filter_list, sort_list, sort_type);
+        let query = Self::select_query_builder(table_name, field_list, filter_list, None, None);
         Self::query_one(pool, QueryType::RAW(query), filter_values, true).await
     }
 
@@ -404,11 +400,8 @@ pub trait Queryable<'a> {
         field_list: Option<Vec<&str>>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
-        sort_list: Option<Vec<&str>>,
-        sort_type: Option<SQLSort>,
     ) -> Result<Option<Row>, SQLError> {
-        let query =
-            Self::select_query_builder(table_name, field_list, filter_list, sort_list, sort_type);
+        let query = Self::select_query_builder(table_name, field_list, filter_list, None, None);
         Self::query_opt(pool, QueryType::RAW(query), filter_values, true).await
     }
 
@@ -449,19 +442,8 @@ pub trait Queryable<'a> {
         table_name: Option<&str>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
-        sort_list: Option<Vec<&str>>,
-        sort_type: Option<SQLSort>,
     ) -> Result<Self::RowType, SQLError> {
-        let row = Self::select_one(
-            pool,
-            table_name,
-            None,
-            filter_list,
-            filter_values,
-            sort_list,
-            sort_type,
-        )
-        .await?;
+        let row = Self::select_one(pool, table_name, None, filter_list, filter_values).await?;
         Ok(Self::parse_type(&row)?)
     }
 
@@ -473,20 +455,8 @@ pub trait Queryable<'a> {
         table_name: Option<&str>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
-        sort_list: Option<Vec<&str>>,
-        sort_type: Option<SQLSort>,
     ) -> Result<Option<Self::RowType>, SQLError> {
-        match Self::select_opt(
-            pool,
-            table_name,
-            None,
-            filter_list,
-            filter_values,
-            sort_list,
-            sort_type,
-        )
-        .await?
-        {
+        match Self::select_opt(pool, table_name, None, filter_list, filter_values).await? {
             None => Ok(None),
             Some(row) => Ok(Some(Self::parse_type(&row)?)),
         }
@@ -550,8 +520,6 @@ pub trait Queryable<'a> {
             Some(vec![&format!("MIN({}) as min", field_name)]),
             filter_list,
             filter_values,
-            None,
-            None,
         )
         .await?
         .get("min"))
@@ -574,8 +542,6 @@ pub trait Queryable<'a> {
             Some(vec![&format!("MAX({}) as max", field_name)]),
             filter_list,
             filter_values,
-            None,
-            None,
         )
         .await?
         .get("max"))

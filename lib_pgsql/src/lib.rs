@@ -4,7 +4,7 @@
 //!
 //! `Queryable` is an async trait that can connect a general struct to PostgreSQL
 //!
-//! ```
+//! ```no_run
 //! use postgres_from_row::FromRow;
 //! use serde::{Deserialize, Serialize};
 //! use tokio;
