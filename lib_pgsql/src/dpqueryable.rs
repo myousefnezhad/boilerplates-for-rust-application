@@ -1,16 +1,16 @@
-use crate::client::{self, PgClient};
 use crate::common::{QueryType, SQLCondition, SQLError, SQLSort};
+use crate::pool::PgPools;
 use async_trait::async_trait;
 use core::iter::IntoIterator;
 use core::marker::Sync;
+use deadpool_postgres::Client;
 use futures_util::{pin_mut, TryStreamExt};
-use log::{self, debug, warn};
+use log::{self, debug};
 use num::One;
 use postgres_from_row::FromRow;
 use serde::Serialize;
 use std::fs::read_to_string;
 use std::ops::Add;
-use tokio_postgres::Client;
 use tokio_postgres::Statement;
 use tokio_postgres::{
     types::{FromSql, ToSql},
@@ -19,7 +19,7 @@ use tokio_postgres::{
 
 /// This is an async trait that can implement PostgreSQL operation for a Rust struct
 #[async_trait]
-pub trait Queryable<'a> {
+pub trait DPQueryable<'a> {
     /// This should be `Self` for each struct in `impl` section
     ///
     /// ```
@@ -53,6 +53,13 @@ pub trait Queryable<'a> {
         Ok(client.prepare(query).await?)
     }
 
+    /// Like [`prepare`], but reads cached statements first
+    ///
+    /// [`prepare`]: #method.prepare
+    async fn prepare_cached(client: &Client, query: &str) -> Result<Statement, SQLError> {
+        Ok(client.prepare_cached(query).await?)
+    }
+
     /// This function reads SQL file (text format) from provided full path
     fn read_sql_file(file: &str) -> Result<String, SQLError> {
         Ok(read_to_string(file)?)
@@ -61,13 +68,13 @@ pub trait Queryable<'a> {
     /// Parse QueryType to load a query from raw string, file, or lib folder
     async fn query_as_string(
         query: &QueryType,
-        client: Option<&PgClient>,
+        pool: Option<&PgPools>,
     ) -> Result<String, SQLError> {
         Ok(match query {
             QueryType::RAW(query) => query.to_string(),
             QueryType::FILE(file) => Self::read_sql_file(file)?,
             QueryType::LIB(lib) => {
-                Self::read_sql_file(&format!("{}/{}", client.unwrap().lib_path, lib))?
+                Self::read_sql_file(&format!("{}/{}", pool.unwrap().query_lib_path, lib))?
             }
         })
     }
@@ -83,19 +90,14 @@ pub trait Queryable<'a> {
     ///
     /// If the statement does not modify any rows (e.g. `SELECT`), 0 is returned.
     async fn execute(
-        pg_client: &PgClient,
+        pool: &PgPools,
         query: QueryType,
         params: &[&(dyn ToSql + Sync)],
         is_read_only: bool,
     ) -> Result<u64, SQLError> {
-        let (client, connection) = pg_client.connection(is_read_only).await?;
-        let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
-        let statement = Self::prepare(&client, &query_str).await?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                warn!("{:?}", e);
-            }
-        });
+        let client = pool.connection(is_read_only).get().await?;
+        let query_str = Self::query_as_string(&query, Some(&pool)).await?;
+        let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Execute {}", query_str);
         Ok(client.execute(&statement, params).await?)
     }
@@ -107,7 +109,7 @@ pub trait Queryable<'a> {
     ///
     /// [`execute`]: #method.execute
     async fn execute_raw<P, I>(
-        pg_client: &PgClient,
+        pool: &PgPools,
         query: QueryType,
         params: I,
         is_read_only: bool,
@@ -117,14 +119,9 @@ pub trait Queryable<'a> {
         I: IntoIterator<Item = P> + Sync + Send,
         I::IntoIter: ExactSizeIterator,
     {
-        let (client, connection) = pg_client.connection(is_read_only).await?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                warn!("{:?}", e);
-            }
-        });
-        let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
-        let statement = Self::prepare(&client, &query_str).await?;
+        let client = pool.connection(is_read_only).get().await?;
+        let query_str = Self::query_as_string(&query, Some(&pool)).await?;
+        let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Execute raw {}", query_str);
         Ok(client.execute_raw(&statement, params).await?)
     }
@@ -134,19 +131,14 @@ pub trait Queryable<'a> {
     /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
     /// provided, 1-indexed.
     async fn query(
-        pg_client: &PgClient,
+        pool: &PgPools,
         query: QueryType,
         params: &[&(dyn ToSql + Sync)],
         is_read_only: bool,
     ) -> Result<Vec<Row>, SQLError> {
-        let (client, connection) = pg_client.connection(is_read_only).await?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                warn!("{:?}", e);
-            }
-        });
-        let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
-        let statement = Self::prepare(&client, &query_str).await?;
+        let client = pool.connection(is_read_only).get().await?;
+        let query_str = Self::query_as_string(&query, Some(&pool)).await?;
+        let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Query {}", query_str);
         Ok(client.query(&statement, params).await?)
     }
@@ -158,19 +150,14 @@ pub trait Queryable<'a> {
     /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
     /// provided, 1-indexed.
     async fn query_one(
-        pg_client: &PgClient,
+        pool: &PgPools,
         query: QueryType,
         params: &[&(dyn ToSql + Sync)],
         is_read_only: bool,
     ) -> Result<Row, SQLError> {
-        let (client, connection) = pg_client.connection(is_read_only).await?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                warn!("{:?}", e);
-            }
-        });
-        let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
-        let statement = Self::prepare(&client, &query_str).await?;
+        let client = pool.connection(is_read_only).get().await?;
+        let query_str = Self::query_as_string(&query, Some(&pool)).await?;
+        let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Query one {}", query_str);
         Ok(client.query_one(&statement, params).await?)
     }
@@ -182,19 +169,14 @@ pub trait Queryable<'a> {
     /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
     /// provided, 1-indexed.
     async fn query_opt(
-        pg_client: &PgClient,
+        pool: &PgPools,
         query: QueryType,
         params: &[&(dyn ToSql + Sync)],
         is_read_only: bool,
     ) -> Result<Option<Row>, SQLError> {
-        let (client, connection) = pg_client.connection(is_read_only).await?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                warn!("{:?}", e);
-            }
-        });
-        let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
-        let statement = Self::prepare(&client, &query_str).await?;
+        let client = pool.connection(is_read_only).get().await?;
+        let query_str = Self::query_as_string(&query, Some(&pool)).await?;
+        let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Query opt {}", query_str);
         Ok(client.query_opt(&statement, params).await?)
     }
@@ -206,7 +188,7 @@ pub trait Queryable<'a> {
     ///
     /// [`query`]: #method.query
     async fn query_raw<I, P>(
-        pg_client: &PgClient,
+        pool: &PgPools,
         query: QueryType,
         params: I,
         is_read_only: bool,
@@ -216,14 +198,9 @@ pub trait Queryable<'a> {
         I: IntoIterator<Item = P> + Sync + Send,
         I::IntoIter: ExactSizeIterator,
     {
-        let (client, connection) = pg_client.connection(is_read_only).await?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                warn!("{:?}", e);
-            }
-        });
-        let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
-        let statement = Self::prepare(&client, &query_str).await?;
+        let client = pool.connection(is_read_only).get().await?;
+        let query_str = Self::query_as_string(&query, Some(&pool)).await?;
+        let statement = Self::prepare_cached(&client, &query_str).await?;
         debug!("Query raw {}", query_str);
         Ok(client.query_raw(&statement, params).await?)
     }
@@ -245,12 +222,12 @@ pub trait Queryable<'a> {
     ///
     /// [`query`]: #method.query
     async fn query_typed(
-        pg_client: &PgClient,
+        pool: &PgPools,
         query: QueryType,
         params: &[&(dyn ToSql + Sync)],
         is_read_only: bool,
     ) -> Result<Vec<Self::RowType>, SQLError> {
-        let raws = Self::query(pg_client, query, params, is_read_only).await?;
+        let raws = Self::query(pool, query, params, is_read_only).await?;
         raws.into_iter()
             .map(|row| {
                 let res = Self::parse_type(&row)?;
@@ -263,12 +240,12 @@ pub trait Queryable<'a> {
     ///
     /// [`query_one`]: #method.query_one
     async fn query_one_typed(
-        pg_client: &PgClient,
+        pool: &PgPools,
         query: QueryType,
         params: &[&(dyn ToSql + Sync)],
         is_read_only: bool,
     ) -> Result<Self::RowType, SQLError> {
-        let row = Self::query_one(pg_client, query, params, is_read_only).await?;
+        let row = Self::query_one(pool, query, params, is_read_only).await?;
         Ok(Self::parse_type(&row)?)
     }
 
@@ -276,12 +253,12 @@ pub trait Queryable<'a> {
     ///
     /// [`query_opt`]: #method.query_opt
     async fn query_opt_typed(
-        pg_client: &PgClient,
+        pool: &PgPools,
         query: QueryType,
         params: &[&(dyn ToSql + Sync)],
         is_read_only: bool,
     ) -> Result<Option<Self::RowType>, SQLError> {
-        match Self::query_opt(pg_client, query, params, is_read_only).await? {
+        match Self::query_opt(pool, query, params, is_read_only).await? {
             None => Ok(None),
             Some(row) => Ok(Some(Self::parse_type(&row)?)),
         }
@@ -291,7 +268,7 @@ pub trait Queryable<'a> {
     ///
     /// [`query_raw`]: #method.query_raw
     async fn query_raw_typed<I, P>(
-        pg_client: &PgClient,
+        pool: &PgPools,
         query: QueryType,
         params: I,
         is_read_only: bool,
@@ -302,7 +279,7 @@ pub trait Queryable<'a> {
         I::IntoIter: ExactSizeIterator,
     {
         let mut result: Vec<Self::RowType> = Vec::new();
-        let raws = Self::query_raw(pg_client, query, params, is_read_only).await?;
+        let raws = Self::query_raw(pool, query, params, is_read_only).await?;
         pin_mut!(raws);
         while let Some(row) = raws.try_next().await? {
             let res = Self::parse_type(&row)?;
@@ -388,7 +365,7 @@ pub trait Queryable<'a> {
 
     /// Running a `SELECT` query and return a vector of PostgreSQL `Row` type
     async fn select(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         field_list: Option<Vec<&str>>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
@@ -398,42 +375,42 @@ pub trait Queryable<'a> {
     ) -> Result<Vec<Row>, SQLError> {
         let query =
             Self::select_query_builder(table_name, field_list, filter_list, sort_list, sort_type);
-        Self::query(pg_client, QueryType::RAW(query), filter_values, true).await
+        Self::query(pool, QueryType::RAW(query), filter_values, true).await
     }
 
     /// Like [`select`], but output should be just one row, unless cause error
     ///
     /// [`select`]: #method.select
     async fn select_one(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         field_list: Option<Vec<&str>>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
     ) -> Result<Row, SQLError> {
         let query = Self::select_query_builder(table_name, field_list, filter_list, None, None);
-        Self::query_one(pg_client, QueryType::RAW(query), filter_values, true).await
+        Self::query_one(pool, QueryType::RAW(query), filter_values, true).await
     }
 
     /// Like [`select`], but output should be maximum one row or nothing, unless cause error
     ///
     /// [`select`]: #method.select
     async fn select_opt(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         field_list: Option<Vec<&str>>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
     ) -> Result<Option<Row>, SQLError> {
         let query = Self::select_query_builder(table_name, field_list, filter_list, None, None);
-        Self::query_opt(pg_client, QueryType::RAW(query), filter_values, true).await
+        Self::query_opt(pool, QueryType::RAW(query), filter_values, true).await
     }
 
     /// Like [`select`], but parse output to Rust `RowType` provided in implementation of this trait
     ///
     /// [`select`]: #method.select
     async fn select_typed(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
@@ -441,7 +418,7 @@ pub trait Queryable<'a> {
         sort_type: Option<SQLSort>,
     ) -> Result<Vec<Self::RowType>, SQLError> {
         let raws = Self::select(
-            pg_client,
+            pool,
             table_name,
             None,
             filter_list,
@@ -462,12 +439,12 @@ pub trait Queryable<'a> {
     ///
     /// [`select_one`]: #method.select_one
     async fn select_one_typed(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
     ) -> Result<Self::RowType, SQLError> {
-        let row = Self::select_one(pg_client, table_name, None, filter_list, filter_values).await?;
+        let row = Self::select_one(pool, table_name, None, filter_list, filter_values).await?;
         Ok(Self::parse_type(&row)?)
     }
 
@@ -475,12 +452,12 @@ pub trait Queryable<'a> {
     ///
     /// [`select_opt`]: #method.select_opt
     async fn select_opt_typed(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
     ) -> Result<Option<Self::RowType>, SQLError> {
-        match Self::select_opt(pg_client, table_name, None, filter_list, filter_values).await? {
+        match Self::select_opt(pool, table_name, None, filter_list, filter_values).await? {
             None => Ok(None),
             Some(row) => Ok(Some(Self::parse_type(&row)?)),
         }
@@ -488,24 +465,24 @@ pub trait Queryable<'a> {
 
     /// Run a `SELECT` query and return number of rows
     async fn count(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
     ) -> Result<u64, SQLError> {
         let query = Self::select_query_builder(table_name, None, filter_list, None, None);
-        Self::execute(pg_client, QueryType::RAW(query), filter_values, true).await
+        Self::execute(pool, QueryType::RAW(query), filter_values, true).await
     }
 
     /// Run a `SELECT` query and return `true` if find any row(s)
     async fn exists(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
     ) -> Result<bool, SQLError> {
         Ok(
-            match Self::count(pg_client, table_name, filter_list, filter_values).await? {
+            match Self::count(pool, table_name, filter_list, filter_values).await? {
                 0 => false,
                 _ => true,
             },
@@ -514,13 +491,13 @@ pub trait Queryable<'a> {
 
     /// Run a 'SELECT' query and return `true` if exactly find one row
     async fn exists_one(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
     ) -> Result<bool, SQLError> {
         Ok(
-            match Self::count(pg_client, table_name, filter_list, filter_values).await? {
+            match Self::count(pool, table_name, filter_list, filter_values).await? {
                 1 => true,
                 _ => false,
             },
@@ -529,7 +506,7 @@ pub trait Queryable<'a> {
 
     /// Calculate SQL `MIN()` value of generic type `T` using a PostgreSQL `SELECT` query
     async fn min<T>(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         field_name: &str,
         filter_list: Option<Vec<SQLCondition<'_>>>,
@@ -539,7 +516,7 @@ pub trait Queryable<'a> {
         for<'b> T: FromSql<'b>,
     {
         Ok(Self::select_one(
-            pg_client,
+            pool,
             table_name,
             Some(vec![&format!("MIN({}) as min", field_name)]),
             filter_list,
@@ -551,7 +528,7 @@ pub trait Queryable<'a> {
 
     /// Calculate SQL `MAX()` value of generic type `T` using a PostgreSQL `SELECT` query
     async fn max<T>(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         field_name: &str,
         filter_list: Option<Vec<SQLCondition<'_>>>,
@@ -561,7 +538,7 @@ pub trait Queryable<'a> {
         for<'b> T: FromSql<'b>,
     {
         Ok(Self::select_one(
-            pg_client,
+            pool,
             table_name,
             Some(vec![&format!("MAX({}) as max", field_name)]),
             filter_list,
@@ -575,19 +552,19 @@ pub trait Queryable<'a> {
     ///
     /// [`max`]: #method.max
     async fn next<T>(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         field_name: &str,
     ) -> Result<T, SQLError>
     where
         for<'b> T: FromSql<'b> + Add<T, Output = T> + Copy + One,
     {
-        Ok(Self::max::<T>(pg_client, table_name, field_name, None, &[]).await? + One::one())
+        Ok(Self::max::<T>(pool, table_name, field_name, None, &[]).await? + One::one())
     }
 
     /// Insert one row to PostgreSQL
     async fn insert(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         field_list: Option<Vec<&str>>,
         values: &[&(dyn ToSql + Sync)],
@@ -608,12 +585,12 @@ pub trait Queryable<'a> {
                 query = format!("{} ({}) VALUES ({});", query, fields.join(", "), params)
             }
         };
-        Self::execute(pg_client, QueryType::RAW(query), values, false).await
+        Self::execute(pool, QueryType::RAW(query), values, false).await
     }
 
     /// Running `DELETE` query based on provided conditions
     async fn delete(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         filter_list: Option<Vec<SQLCondition<'_>>>,
         filter_values: &[&(dyn ToSql + Sync)],
@@ -624,7 +601,7 @@ pub trait Queryable<'a> {
         };
         let filters = Self::filter_query_builder(filter_list, 0);
         let query = format!("DELETE FROM {} {}", table_name, filters);
-        Self::execute(pg_client, QueryType::RAW(query), filter_values, false).await
+        Self::execute(pool, QueryType::RAW(query), filter_values, false).await
     }
 
     /// Generating a list of SQL update field based on a vector of string
@@ -646,7 +623,7 @@ pub trait Queryable<'a> {
 
     /// Running `UPDATE` query based on provided params
     async fn update(
-        pg_client: &PgClient,
+        pool: &PgPools,
         table_name: Option<&str>,
         update_list: Vec<&str>,
         update_values: &[&(dyn ToSql + Sync)],
@@ -664,6 +641,6 @@ pub trait Queryable<'a> {
         let filters = Self::filter_query_builder(filter_list, offset);
         let query = format!("UPDATE {} SET {} {}", table_name, lists, filters);
         let params = [update_values, filter_values].concat();
-        Self::execute(pg_client, QueryType::RAW(query), &params, false).await
+        Self::execute(pool, QueryType::RAW(query), &params, false).await
     }
 }

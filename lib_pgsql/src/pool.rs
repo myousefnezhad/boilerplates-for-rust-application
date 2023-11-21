@@ -1,8 +1,6 @@
 use std::usize;
 
-use core::time::Duration;
-use deadpool::managed::QueueMode;
-use deadpool_postgres::{Config, Pool, PoolConfig, Runtime::Tokio1, Timeouts};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres::NoTls;
 
 /// This struct provides read/write pools for PostgreSQL and path of query libraris
@@ -41,40 +39,35 @@ impl PgPools {
         write_pool_size: usize,
         lib_path: String,
     ) -> Self {
-        let wait_time = Duration::from_secs(5);
-        let mut pg_read_config = Config::new();
-        pg_read_config.user = Some(user.to_string());
-        pg_read_config.password = Some(pass.to_string());
-        pg_read_config.dbname = Some(db_name.to_string());
-        pg_read_config.port = Some(read_port);
-        pg_read_config.host = Some(read_host.to_string());
-        pg_read_config.pool = Some(PoolConfig {
-            max_size: read_pool_size,
-            timeouts: Timeouts {
-                wait: Some(wait_time),
-                create: None,
-                recycle: None,
-            },
-            queue_mode: QueueMode::Fifo,
-        });
-        let mut pg_write_config = Config::new();
-        pg_write_config.user = Some(user.to_string());
-        pg_write_config.password = Some(pass.to_string());
-        pg_write_config.dbname = Some(db_name.to_string());
-        pg_write_config.port = Some(write_port);
-        pg_write_config.host = Some(write_host.to_string());
-        pg_write_config.pool = Some(PoolConfig {
-            max_size: write_pool_size,
-            timeouts: Timeouts {
-                wait: Some(wait_time),
-                create: None,
-                recycle: None,
-            },
-            queue_mode: QueueMode::Fifo,
-        });
+        let mut pg_read_config = tokio_postgres::Config::new();
+        pg_read_config.user(user);
+        pg_read_config.password(pass);
+        pg_read_config.dbname(db_name);
+        pg_read_config.port(read_port);
+        pg_read_config.host(read_host);
+        let pg_read_mgr_cfg = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+        let pg_read_mgr = Manager::from_config(pg_read_config, NoTls, pg_read_mgr_cfg);
+        let mut pg_write_config = tokio_postgres::Config::new();
+        pg_write_config.user(user);
+        pg_write_config.password(pass);
+        pg_write_config.dbname(db_name);
+        pg_write_config.port(write_port);
+        pg_write_config.host(write_host);
+        let pg_write_mgr_cfg = ManagerConfig {
+            recycling_method: RecyclingMethod::Clean,
+        };
+        let pg_write_mgr = Manager::from_config(pg_write_config, NoTls, pg_write_mgr_cfg);
         Self {
-            read_pool: pg_read_config.create_pool(Some(Tokio1), NoTls).unwrap(),
-            write_pool: pg_write_config.create_pool(Some(Tokio1), NoTls).unwrap(),
+            read_pool: Pool::builder(pg_read_mgr)
+                .max_size(read_pool_size)
+                .build()
+                .unwrap(),
+            write_pool: Pool::builder(pg_write_mgr)
+                .max_size(write_pool_size)
+                .build()
+                .unwrap(),
             query_lib_path: lib_path,
         }
     }

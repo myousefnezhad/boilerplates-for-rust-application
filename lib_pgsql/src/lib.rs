@@ -55,13 +55,18 @@
 //! postgres-types = { version = "", features = ["derive"] }
 //!```
 
+/// This module provide client for conncting to PostgreSQL
+pub mod client;
 /// This module provides common `enum` and `struct` for PostgreSQL operations
 pub mod common;
-/// This module provides libraries and functions to generate PostgreSQL connection pools
+/// This module provides an async trait for PostgreSQL operations for Rust structs (using deadpool)
+pub mod dpqueryable;
+/// This module provides libraries and functions to generate Dead Pool PostgreSQL connection pools
 pub mod pool;
-/// This module provides an async trait for PostgreSQL operations for Rust structs
+/// This module provides an async trait for PostgreSQL operations for Rust structs (using tokio-postgres)
 pub mod queryable;
 
+pub use client::PgClient;
 pub use common::{QueryType, SQLCondition, SQLError, SQLSort};
 pub use futures_util::pin_mut;
 pub use pool::PgPools;
