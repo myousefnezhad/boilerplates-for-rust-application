@@ -1,4 +1,4 @@
-use crate::client::{self, PgClient};
+use crate::client::PgClient;
 use crate::common::{QueryType, SQLCondition, SQLError, SQLSort};
 use async_trait::async_trait;
 use core::iter::IntoIterator;
@@ -14,7 +14,7 @@ use tokio_postgres::Client;
 use tokio_postgres::Statement;
 use tokio_postgres::{
     types::{FromSql, ToSql},
-    Row, RowStream,
+    Row, RowStream, SimpleQueryMessage,
 };
 
 /// This is an async trait that can implement PostgreSQL operation for a Rust struct
@@ -89,15 +89,17 @@ pub trait Queryable<'a> {
         is_read_only: bool,
     ) -> Result<u64, SQLError> {
         let (client, connection) = pg_client.connection(is_read_only).await?;
-        let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
-        let statement = Self::prepare(&client, &query_str).await?;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 warn!("{:?}", e);
             }
         });
+        let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
+        let statement = Self::prepare(&client, &query_str).await?;
         debug!("Execute {}", query_str);
-        Ok(client.execute(&statement, params).await?)
+        let res = client.execute(&statement, params).await?;
+        handle.abort();
+        Ok(res)
     }
 
     /// The maximally flexible version of [`execute`].
@@ -118,7 +120,7 @@ pub trait Queryable<'a> {
         I::IntoIter: ExactSizeIterator,
     {
         let (client, connection) = pg_client.connection(is_read_only).await?;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 warn!("{:?}", e);
             }
@@ -126,7 +128,9 @@ pub trait Queryable<'a> {
         let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
         let statement = Self::prepare(&client, &query_str).await?;
         debug!("Execute raw {}", query_str);
-        Ok(client.execute_raw(&statement, params).await?)
+        let res = client.execute_raw(&statement, params).await?;
+        handle.abort();
+        Ok(res)
     }
 
     /// Executes a statement, returning a vector of the resulting rows.
@@ -140,7 +144,7 @@ pub trait Queryable<'a> {
         is_read_only: bool,
     ) -> Result<Vec<Row>, SQLError> {
         let (client, connection) = pg_client.connection(is_read_only).await?;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 warn!("{:?}", e);
             }
@@ -148,7 +152,9 @@ pub trait Queryable<'a> {
         let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
         let statement = Self::prepare(&client, &query_str).await?;
         debug!("Query {}", query_str);
-        Ok(client.query(&statement, params).await?)
+        let res = client.query(&statement, params).await?;
+        handle.abort();
+        Ok(res)
     }
 
     /// Executes a statement which returns a single row, returning it.
@@ -164,7 +170,7 @@ pub trait Queryable<'a> {
         is_read_only: bool,
     ) -> Result<Row, SQLError> {
         let (client, connection) = pg_client.connection(is_read_only).await?;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 warn!("{:?}", e);
             }
@@ -172,7 +178,9 @@ pub trait Queryable<'a> {
         let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
         let statement = Self::prepare(&client, &query_str).await?;
         debug!("Query one {}", query_str);
-        Ok(client.query_one(&statement, params).await?)
+        let res = client.query_one(&statement, params).await?;
+        handle.abort();
+        Ok(res)
     }
 
     /// Executes a statements which returns zero or one rows, returning it.
@@ -188,7 +196,7 @@ pub trait Queryable<'a> {
         is_read_only: bool,
     ) -> Result<Option<Row>, SQLError> {
         let (client, connection) = pg_client.connection(is_read_only).await?;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 warn!("{:?}", e);
             }
@@ -196,7 +204,9 @@ pub trait Queryable<'a> {
         let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
         let statement = Self::prepare(&client, &query_str).await?;
         debug!("Query opt {}", query_str);
-        Ok(client.query_opt(&statement, params).await?)
+        let res = client.query_opt(&statement, params).await?;
+        handle.abort();
+        Ok(res)
     }
 
     /// The maximally flexible version of [`query`].
@@ -217,7 +227,7 @@ pub trait Queryable<'a> {
         I::IntoIter: ExactSizeIterator,
     {
         let (client, connection) = pg_client.connection(is_read_only).await?;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 warn!("{:?}", e);
             }
@@ -225,7 +235,30 @@ pub trait Queryable<'a> {
         let query_str = Self::query_as_string(&query, Some(&pg_client)).await?;
         let statement = Self::prepare(&client, &query_str).await?;
         debug!("Query raw {}", query_str);
-        Ok(client.query_raw(&statement, params).await?)
+        let res = client.query_raw(&statement, params).await?;
+        handle.abort();
+        Ok(res)
+    }
+
+    /// Executes a sequence of SQL statements using the simple query protocol, returning the resulting rows.
+    ///
+    /// Statements should be separated by semicolons. If an error occurs, execution of the sequence will stop at that point. The simple query protocol returns the values in rows as strings rather than in their binary encodings, so the associated row type doesn’t work with the FromSql trait. Rather than simply returning a list of the rows, this method returns a list of an enum which indicates either the completion of one of the commands, or a row of data. This preserves the framing between the separate statements in the request.
+    async fn simple_query(
+        pg_client: &PgClient,
+        query: QueryType,
+        is_read_only: bool,
+    ) -> Result<Vec<SimpleQueryMessage>, SQLError> {
+        let (client, connection) = pg_client.connection(is_read_only).await?;
+        let handle = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                warn!("{:?}", e);
+            }
+        });
+        let query = Self::query_as_string(&query, Some(&pg_client)).await?;
+        debug!("Query {}", query);
+        let res = client.simple_query(&query).await?;
+        handle.abort();
+        Ok(res)
     }
 
     /// This function converts PostgreSQL Row type to provided type in RowType section (Rust struct type)

@@ -15,7 +15,7 @@
 //!    name: String,
 //! }
 //!
-//! impl Queryable<'_> for ExampleTable {
+//! impl DPQueryable<'_> for ExampleTable {
 //!    type RowType = Self;
 //!    fn table_name() -> &'static str {
 //!        "public.example_table"
@@ -74,4 +74,5 @@ pub use postgres_from_row::FromRow;
 pub use queryable::Queryable;
 pub use serde::{Deserialize, Serialize};
 pub use tokio;
+pub use tokio::spawn;
 pub use tokio_postgres::types::{FromSql, ToSql};
